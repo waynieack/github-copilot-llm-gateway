@@ -59,6 +59,11 @@
         "command": "github.copilot.llm-gateway.testConnection",
         "title": "Test Server Connection",
         "category": "GitHub Copilot LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.refreshModels",
+        "title": "Refresh Models",
+        "category": "GitHub Copilot LLM Gateway"
       }
     ],
     "configuration": {

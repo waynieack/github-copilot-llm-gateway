@@ -7,6 +7,35 @@ import {
 } from './types';
 
 /**
+ * Trim trailing slashes and a trailing `/v1` (or `/openai/v1`) segment so the
+ * client can safely append `/v1/models` / `/v1/chat/completions` regardless of
+ * how the user typed their Server URL in settings.
+ *
+ * Users often paste the exact URL they tested with curl (which already ends in
+ * `/v1`) or leave a trailing slash from copy-paste; both produced 404s before
+ * this normalisation existed.
+ */
+export function normalizeBaseUrl(rawUrl: string): string {
+  let url = rawUrl.trim();
+  // Strip trailing slashes.
+  url = url.replace(/\/+$/, '');
+  // If the URL already ends with /v1 or /openai/v1, drop it.
+  url = url.replace(/\/(openai\/)?v1$/i, '');
+  return url;
+}
+
+/**
+ * Strip a leading `Bearer ` (case-insensitive) from the configured API key
+ * and trim whitespace. The client always prepends `Bearer`, so users who
+ * paste their full `Authorization: Bearer …` header would otherwise send
+ * `Bearer Bearer …` and get 401s.
+ */
+export function normalizeApiKey(rawKey: string | undefined): string {
+  if (!rawKey) { return ''; }
+  return rawKey.trim().replace(/^Bearer\s+/i, '');
+}
+
+/**
  * Accumulated tool call during streaming
  */
 interface StreamingToolCall {
@@ -78,28 +107,49 @@ export class GatewayClient {
   }
 
   /**
-   * Fetch available models from /v1/models endpoint
+   * Fetch available models from the server's models endpoint.
+   *
+   * Tries `/v1/models` first and falls back to `/models` so the client works
+   * against servers that mount the OpenAI API at the root (e.g. LM Studio in
+   * some configurations).
    */
-  public async fetchModels(): Promise<OpenAIModelsResponse> {
-    const url = `${this.config.serverUrl}/v1/models`;
+  public async fetchModels(cancellationToken?: vscode.CancellationToken): Promise<OpenAIModelsResponse> {
+    const base = normalizeBaseUrl(this.config.serverUrl);
+    const candidates = [`${base}/v1/models`, `${base}/models`];
+    let lastError: Error | undefined;
 
-    try {
-      const response = await this.fetch(url, {
-        method: 'GET',
-        headers: this.getHeaders(),
-      });
+    for (const url of candidates) {
+      try {
+        const response = await this.fetch(url, {
+          method: 'GET',
+          headers: this.getHeaders(),
+        }, cancellationToken);
 
-      if (!response.ok) {
-        throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}`);
+        if (response.ok) {
+          return await response.json();
+        }
+
+        // 404 against the first candidate? Try the fallback.
+        if (response.status === 404 && url !== candidates[candidates.length - 1]) {
+          this.log(`Models endpoint not found at ${url}, trying fallback...`);
+          continue;
+        }
+
+        const bodyText = await response.text().catch(() => '');
+        const truncated = bodyText.length > 200 ? `${bodyText.slice(0, 200)}...` : bodyText;
+        throw new Error(
+          `Failed to fetch models from ${url}: ${response.status} ${response.statusText}${truncated ? ` — ${truncated}` : ''}`
+        );
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (url === candidates[candidates.length - 1]) {
+          break;
+        }
       }
-
-      return await response.json();
-    } catch (error) {
-      if (error instanceof Error) {
-        throw new Error(`Failed to connect to inference server: ${error.message}`);
-      }
-      throw error;
     }
+
+    const message = lastError?.message ?? 'unknown error';
+    throw new Error(`Failed to connect to inference server at ${base}: ${message}`);
   }
 
   /**
@@ -330,7 +380,7 @@ export class GatewayClient {
     request: OpenAIChatCompletionRequest,
     cancellationToken: vscode.CancellationToken
   ): AsyncGenerator<{ content: string; reasoning_content: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] }, void, unknown> {
-    const url = `${this.config.serverUrl}/v1/chat/completions`;
+    const url = `${normalizeBaseUrl(this.config.serverUrl)}/v1/chat/completions`;
     const state = this.createToolCallState();
 
     try {
@@ -338,7 +388,7 @@ export class GatewayClient {
         method: 'POST',
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...request, stream: true }),
-      });
+      }, cancellationToken);
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -391,28 +441,36 @@ export class GatewayClient {
   private getHeaders(): Record<string, string> {
     const headers: Record<string, string> = {};
 
-    if (this.config.apiKey) {
-      headers['Authorization'] = `Bearer ${this.config.apiKey}`;
+    const key = normalizeApiKey(this.config.apiKey);
+    if (key) {
+      headers['Authorization'] = `Bearer ${key}`;
     }
 
     return headers;
   }
 
   /**
-   * Fetch wrapper with timeout support
+   * Fetch wrapper with timeout support. When a cancellationToken is passed,
+   * cancellation is wired into the underlying AbortController so the in-flight
+   * request is aborted as soon as the user closes the chat / model picker.
    */
-  private async fetch(url: string, options: RequestInit): Promise<Response> {
+  private async fetch(
+    url: string,
+    options: RequestInit,
+    cancellationToken?: vscode.CancellationToken
+  ): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+    const cancelSub = cancellationToken?.onCancellationRequested(() => controller.abort());
 
     try {
-      const response = await fetch(url, {
+      return await fetch(url, {
         ...options,
         signal: controller.signal,
       });
-      return response;
     } finally {
       clearTimeout(timeoutId);
+      cancelSub?.dispose();
     }
   }
 }

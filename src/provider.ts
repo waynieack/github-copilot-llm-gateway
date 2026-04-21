@@ -24,6 +24,13 @@ import {
   isEmptyStreamResult,
   streamResponse,
 } from './responseStreamer';
+import {
+  dedupeModels,
+  describeModel,
+  friendlyModelName,
+  inferModelFamily,
+} from './modelDisplay';
+import { diagnoseModelFetchError } from './errorDiagnostics';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
 const WELCOME_NOTIFICATION_DELAY_MS = 3000;
@@ -31,6 +38,22 @@ const DEFAULT_TEMPERATURE = 0.7;
 const DEBUG_REQUEST_MAX_LOG_LENGTH = 2000;
 const MAX_TOOL_ARGS_LOG_LENGTH = 1000;
 const MAX_TOOL_DESCRIPTION_LOG_LENGTH = 100;
+
+/**
+ * Setting keys that change the shape of the model list returned from the
+ * server (and so require VS Code to re-request it). Other keys like
+ * `agentTemperature` don't, so we don't want to fire the change event for
+ * them — otherwise every keystroke in the settings UI triggers a re-fetch.
+ */
+const MODEL_AFFECTING_KEYS: readonly string[] = [
+  'github.copilot.llm-gateway.serverUrl',
+  'github.copilot.llm-gateway.apiKey',
+  'github.copilot.llm-gateway.requestTimeout',
+  'github.copilot.llm-gateway.defaultMaxTokens',
+  'github.copilot.llm-gateway.defaultMaxOutputTokens',
+  'github.copilot.llm-gateway.enableImageInput',
+  'github.copilot.llm-gateway.enableToolCalling',
+];
 
 /**
  * Language model provider for OpenAI-compatible inference servers.
@@ -58,9 +81,15 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     context.subscriptions.push(
       this._onDidChangeLanguageModelChatInformation,
       vscode.workspace.onDidChangeConfiguration((e: vscode.ConfigurationChangeEvent) => {
-        if (e.affectsConfiguration('github.copilot.llm-gateway')) {
-          this.outputChannel.appendLine('Configuration changed, reloading...');
-          this.reloadConfig();
+        if (!e.affectsConfiguration('github.copilot.llm-gateway')) {
+          return;
+        }
+        this.outputChannel.appendLine('Configuration changed, reloading...');
+        this.reloadConfig();
+        // Only nudge VS Code to refetch models when a setting that actually
+        // affects the model list has changed.
+        const affectsModels = MODEL_AFFECTING_KEYS.some((key) => e.affectsConfiguration(key));
+        if (affectsModels) {
           this._onDidChangeLanguageModelChatInformation.fire();
         }
       })
@@ -68,46 +97,75 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
+   * Force a refresh of the language model list. Called from the
+   * `Refresh Models` command so users can re-probe the server without
+   * editing settings.
+   */
+  public refreshModels(): void {
+    this._onDidChangeLanguageModelChatInformation.fire();
+  }
+
+  /**
    * Provide language model information - fetches available models from inference server
    */
   async provideLanguageModelChatInformation(
     options: { silent: boolean },
-    _token: vscode.CancellationToken
+    token: vscode.CancellationToken
   ): Promise<vscode.LanguageModelChatInformation[]> {
     try {
       this.outputChannel.appendLine('Fetching models from inference server...');
-      const response = await this.client.fetchModels();
+      const response = await this.client.fetchModels(token);
 
-      const models = response.data.map(
-        (model) => {
-          const serverContext = model.max_model_len ?? model.context_length ?? model.context_window;
-          const totalContext = serverContext ?? this.config.defaultMaxTokens;
-          const maxOutputTokens = Math.min(
-            this.config.defaultMaxOutputTokens,
+      if (token.isCancellationRequested) {
+        return [];
+      }
+
+      const uniqueModels = dedupeModels(response.data);
+      if (uniqueModels.length !== response.data.length) {
+        this.outputChannel.appendLine(
+          `Server returned ${response.data.length} models, ${uniqueModels.length} unique after dedupe`
+        );
+      }
+
+      const models = uniqueModels.map((model) => {
+        const serverContext = model.max_model_len ?? model.context_length ?? model.context_window;
+        const totalContext = serverContext ?? this.config.defaultMaxTokens;
+        const maxOutputTokens = Math.min(
+          this.config.defaultMaxOutputTokens,
+          Math.max(
+            TOKEN_CONSTANTS.MIN_OUTPUT_TOKENS,
             totalContext - TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER
+          )
+        );
+        // Expose the full server-reported context as `maxInputTokens` so the
+        // VS Code model picker displays the true window size. The provider
+        // still reserves room for output internally in `calculateSafeMaxOutputTokens`.
+        const maxInputTokens = totalContext;
+
+        if (serverContext) {
+          this.outputChannel.appendLine(
+            `  Model ${model.id}: server-reported context ${serverContext} tokens (exposed as input=${maxInputTokens}, output=${maxOutputTokens})`
           );
-          const maxInputTokens = totalContext - maxOutputTokens;
-
-          if (serverContext) {
-            this.outputChannel.appendLine(
-              `  Model ${model.id}: server-reported context ${serverContext} tokens (input=${maxInputTokens}, output=${maxOutputTokens})`
-            );
-          }
-
-          return {
-            id: model.id,
-            name: model.id,
-            family: 'llm-gateway',
-            maxInputTokens,
-            maxOutputTokens,
-            version: '1.0.0',
-            capabilities: {
-              imageInput: this.config.enableImageInput,
-              toolCalling: this.config.enableToolCalling,
-            },
-          } as vscode.LanguageModelChatInformation;
         }
-      );
+
+        const detail = describeModel(model);
+
+        return {
+          id: model.id,
+          name: friendlyModelName(model.id),
+          family: inferModelFamily(model.id),
+          maxInputTokens,
+          maxOutputTokens,
+          version: '1.0.0',
+          description: detail || undefined,
+          tooltip: detail ? `${model.id} — ${detail}` : model.id,
+          detail,
+          capabilities: {
+            imageInput: this.config.enableImageInput,
+            toolCalling: this.config.enableToolCalling,
+          },
+        } as vscode.LanguageModelChatInformation;
+      });
 
       this.outputChannel.appendLine(
         `Found ${models.length} models: ${models.map((m) => m.id).join(', ')}`
@@ -119,7 +177,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
       if (!options.silent) {
         this.promptOpenSettings(
-          `GitHub Copilot LLM Gateway: Failed to fetch models. ${errorMessage}`
+          `GitHub Copilot LLM Gateway: Failed to fetch models. ${diagnoseModelFetchError(errorMessage)}`
         );
       }
 
@@ -598,8 +656,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     try {
       new URL(cfg.serverUrl);
     } catch {
-      this.outputChannel.appendLine(`ERROR: Invalid server URL: ${cfg.serverUrl}`);
-      throw new Error(`Invalid server URL: ${cfg.serverUrl}`);
+      const fallback = 'http://localhost:8000';
+      this.outputChannel.appendLine(
+        `ERROR: Invalid server URL ${JSON.stringify(cfg.serverUrl)}. Falling back to ${fallback}; fix this in settings.`
+      );
+      // Defer UI notification to avoid blocking activation.
+      setImmediate(() => {
+        this.promptOpenSettings(
+          `GitHub Copilot LLM Gateway: Invalid Server URL ${JSON.stringify(cfg.serverUrl)}. Open Settings to fix.`
+        );
+      });
+      cfg.serverUrl = fallback;
     }
 
     if (cfg.defaultMaxOutputTokens >= cfg.defaultMaxTokens) {
