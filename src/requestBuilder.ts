@@ -7,16 +7,11 @@
  * that the server will ignore or reject.
  */
 
-import { OpenAIChatCompletionRequest, OpenAIMessage } from './types';
+import { OpenAIChatCompletionRequest, OpenAIMessage, OpenAIToolDefinition } from './types';
 
-export interface OpenAIToolDefinition {
-  type: 'function';
-  function: {
-    name: string;
-    description?: string;
-    parameters?: unknown;
-  };
-}
+// Re-export so existing callers that imported OpenAIToolDefinition from
+// './requestBuilder' keep compiling without churn.
+export { OpenAIToolDefinition };
 
 export type ToolChoice = 'auto' | 'required' | 'none';
 

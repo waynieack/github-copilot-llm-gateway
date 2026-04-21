@@ -147,6 +147,12 @@ These settings control how the extension handles agentic features like code edit
 
 > **Tip**: If your model outputs tool descriptions as text instead of actually calling tools, try setting **Agent Temperature** to `0.0` and disabling **Parallel Tool Calling**.
 
+### Diagnostic Settings
+
+| Setting              | Default | Description                                                                                                                                        |
+| -------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Verbose Logging**  | `false` | When enabled, the full request body (including messages and tool args) is written to the output channel. Keep disabled unless debugging an issue. |
+
 ## Recommended Models
 
 These models have been tested with good tool calling support:

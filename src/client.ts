@@ -317,7 +317,10 @@ export class GatewayClient {
   }
 
   /**
-   * Process a single SSE line and return yield data if applicable
+   * Process a single SSE line and return yield data if applicable.
+   * Throws when the server reports an error via `event: error` / a JSON
+   * `error` payload so the caller can surface it rather than seeing an
+   * empty stream.
    */
   private processSSELine(
     line: string,
@@ -329,11 +332,40 @@ export class GatewayClient {
       return null;
     }
 
+    // Some OpenAI-compatible servers (notably proxies) emit `event: error`
+    // on a prior line, but most also pack the payload into the following
+    // `data: ...` object with an `error` key. Easier to just look at the
+    // data contents.
+    if (trimmed.startsWith('event:')) {
+      // Caller doesn't see event names; they'll come through on the data line.
+      return null;
+    }
+
     if (!trimmed.startsWith('data: ')) {
       return null;
     }
 
     const data = trimmed.slice(6);
+
+    // Inline error payload: `{ "error": { "message": "..." } }`.
+    // Distinguish from a normal chunk (which has `choices`).
+    try {
+      const maybeErr = JSON.parse(data);
+      if (maybeErr && typeof maybeErr === 'object' && 'error' in maybeErr && !('choices' in maybeErr)) {
+        const err = (maybeErr as { error: unknown }).error;
+        const message =
+          (typeof err === 'object' && err !== null && 'message' in err
+            ? String((err as { message?: unknown }).message)
+            : undefined) ?? JSON.stringify(err);
+        throw new Error(`Inference server reported an error mid-stream: ${message}`);
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith('Inference server reported')) {
+        throw e;
+      }
+      // Not JSON, or not an error payload — fall through to regular parsing.
+    }
+
     const parsed = this.parseSSEData(data);
     if (!parsed) { return null; }
 
@@ -383,12 +415,32 @@ export class GatewayClient {
     const url = `${normalizeBaseUrl(this.config.serverUrl)}/v1/chat/completions`;
     const state = this.createToolCallState();
 
+    // For streaming we manage the abort + timers directly so that the
+    // request timeout only applies until headers arrive; after that, we
+    // enforce a separate per-read inactivity timeout that resets on every
+    // chunk. Otherwise long generations would be aborted mid-stream even
+    // though tokens were arriving continuously.
+    const controller = new AbortController();
+    const cancelSub = cancellationToken.onCancellationRequested(() => controller.abort());
+    const headerTimeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+    let inactivityTimeoutId: ReturnType<typeof setTimeout> | undefined;
+    const resetInactivityTimer = (): void => {
+      if (inactivityTimeoutId) { clearTimeout(inactivityTimeoutId); }
+      inactivityTimeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+    };
+
     try {
-      const response = await this.fetch(url, {
+      const response = await fetch(url, {
         method: 'POST',
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...request, stream: true }),
-      }, cancellationToken);
+        signal: controller.signal,
+      });
+
+      // Headers received — switch from the fixed request timeout to an
+      // inactivity timer that will only fire if the server stalls mid-stream.
+      clearTimeout(headerTimeoutId);
+      resetInactivityTimer();
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -412,6 +464,9 @@ export class GatewayClient {
         const { done, value } = await reader.read();
         if (done) { break; }
 
+        // Any byte from the server counts as activity; reset the inactivity timer.
+        resetInactivityTimer();
+
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -432,6 +487,10 @@ export class GatewayClient {
         throw new Error(`Chat completion request failed: ${error.message}`);
       }
       throw error;
+    } finally {
+      clearTimeout(headerTimeoutId);
+      if (inactivityTimeoutId) { clearTimeout(inactivityTimeoutId); }
+      cancelSub.dispose();
     }
   }
 
