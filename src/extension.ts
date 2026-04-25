@@ -100,6 +100,55 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(testCommand);
 
+  // "Configure Server" command — triggered by the "Add Models..." dropdown
+  // via the managementCommand contribution. Prompts for server URL and API
+  // key, writes them to the extension's settings, and refreshes models.
+  const manageCommand = vscode.commands.registerCommand(
+    'github.copilot.llm-gateway.manage',
+    async () => {
+      const config = vscode.workspace.getConfiguration('github.copilot.llm-gateway');
+      const currentUrl = config.get<string>('serverUrl', 'http://localhost:8000');
+
+      const url = await vscode.window.showInputBox({
+        title: 'LLM Gateway — Server URL',
+        prompt: 'Enter the inference server URL (OpenAI-compatible endpoint)',
+        value: currentUrl,
+        placeHolder: 'http://localhost:8000',
+        ignoreFocusOut: true,
+        validateInput: (value) => {
+          try {
+            new URL(value);
+            return undefined;
+          } catch {
+            return 'Please enter a valid URL';
+          }
+        },
+      });
+      if (url === undefined) { return; } // cancelled
+
+      const apiKey = await vscode.window.showInputBox({
+        title: 'LLM Gateway — API Key',
+        prompt: 'Enter the API key (leave empty if not required)',
+        password: true,
+        placeHolder: 'Optional',
+        ignoreFocusOut: true,
+      });
+      if (apiKey === undefined) { return; } // cancelled
+
+      await config.update('serverUrl', url, vscode.ConfigurationTarget.Global);
+      if (apiKey) {
+        await config.update('apiKey', apiKey, vscode.ConfigurationTarget.Global);
+      }
+
+      // The config-change listener handles reloadConfig + model refresh
+      // automatically, but we also refresh the status bar here.
+      provider.invalidateModelCache();
+      await refreshStatusBar();
+    }
+  );
+
+  context.subscriptions.push(manageCommand);
+
   // Explicit "Refresh Models" command — previously users could only trigger
   // a re-fetch by editing settings, which was confusing when models
   // temporarily went missing.
