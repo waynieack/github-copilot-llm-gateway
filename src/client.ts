@@ -18,7 +18,7 @@ import {
  */
 export function normalizeBaseUrl(rawUrl: string): string {
   let url = rawUrl.trim();
-  url = url.replace(/\/+$/, '');
+  while (url.endsWith('/')) { url = url.slice(0, -1); }
   url = url.replace(/\/(openai\/)?v1$/i, '');
   return url;
 }
