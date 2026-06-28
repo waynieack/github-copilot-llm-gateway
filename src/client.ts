@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import {
   OpenAIChatCompletionRequest,
+  OpenAICompletionRequest,
+  OpenAICompletionResponse,
   OpenAIModelsResponse,
   OpenAIUsage,
   GatewayConfig,
@@ -144,6 +146,24 @@ async function assertChatStreamResponseOk(response: Response): Promise<void> {
   throw new Error('Response body is null');
 }
 
+/**
+ * Node's `fetch` (undici) throws an opaque `TypeError: fetch failed` and stashes
+ * the real reason — DNS failure (`ENOTFOUND`), connection refused
+ * (`ECONNREFUSED`), timeout (`ETIMEDOUT`), TLS error, etc. — on `error.cause`.
+ * Surface that cause so users see *why* the connection failed instead of a bare
+ * "fetch failed".
+ */
+export function describeFetchError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  const cause = (error as { cause?: unknown }).cause;
+  if (cause instanceof Error && cause.message && !error.message.includes(cause.message)) {
+    return `${error.message}: ${cause.message}`;
+  }
+  return error.message;
+}
+
 export class GatewayClient {
   private config: GatewayConfig;
   private readonly log: GatewayLogger;
@@ -180,7 +200,7 @@ export class GatewayClient {
       }
     }
 
-    const message = lastError?.message ?? 'unknown error';
+    const message = lastError ? describeFetchError(lastError) : 'unknown error';
     throw new Error(`Failed to connect to inference server at ${base}: ${message}`);
   }
 
@@ -263,7 +283,7 @@ export class GatewayClient {
       }
     } catch (error) {
       if (error instanceof Error) {
-        throw new Error(`Chat completion request failed: ${error.message}`);
+        throw new Error(`Chat completion request failed: ${describeFetchError(error)}`);
       }
       throw error;
     } finally {
@@ -479,23 +499,62 @@ export class GatewayClient {
     };
   }
 
+  /**
+   * Fetch a single non-streaming completion from `/v1/completions`. Used by the
+   * experimental inline-completion provider for fill-in-the-middle. Takes its
+   * own `timeoutMs` because completions need a much tighter latency budget than
+   * the chat `requestTimeout` default.
+   */
+  public async fetchCompletion(
+    request: OpenAICompletionRequest,
+    cancellationToken: vscode.CancellationToken,
+    timeoutMs: number
+  ): Promise<OpenAICompletionResponse> {
+    const url = `${normalizeBaseUrl(this.config.serverUrl)}/v1/completions`;
+    const response = await this.fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...request, stream: false }),
+      },
+      cancellationToken,
+      timeoutMs
+    );
+
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => '');
+      const truncated = bodyText.length > 200 ? bodyText.slice(0, 200) + '...' : bodyText;
+      const suffix = truncated ? ' — ' + truncated : '';
+      throw new Error(
+        `Completion failed: ${response.status} ${response.statusText}${suffix}`
+      );
+    }
+    return await response.json();
+  }
+
   private getHeaders(): Record<string, string> {
     return buildHeaders(this.config.apiKey, this.config.customHeaders);
   }
 
   /**
-   * Fetch wrapper with a fixed total-request timeout and optional
-   * cancellation-token wiring. Used for non-streaming requests like the
-   * model list. Streaming requests manage their own timers in
-   * `streamChatCompletion`.
+   * Fetch wrapper with a total-request timeout (the configured
+   * `requestTimeout`, or `timeoutMs` when the caller needs a tighter budget)
+   * and optional cancellation-token wiring. Used for non-streaming requests
+   * like the model list and inline completions. Streaming requests manage
+   * their own timers in `streamChatCompletion`.
    */
   private async fetchWithTimeout(
     url: string,
     options: RequestInit,
-    cancellationToken?: vscode.CancellationToken
+    cancellationToken?: vscode.CancellationToken,
+    timeoutMs?: number
   ): Promise<Response> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      timeoutMs ?? this.config.requestTimeout
+    );
     const cancelSub = cancellationToken?.onCancellationRequested(() => controller.abort());
 
     try {

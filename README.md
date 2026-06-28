@@ -47,7 +47,7 @@ If native BYOK already works well for you, you don't need this extension. If you
 
 It also keeps the familiar benefits of self-hosting: inference stays on your network, there are no per-token fees, and your self-hosted models don't draw down Copilot premium quota.
 
-> **Privacy note**: This extension routes **LLM inference to your configured server only** — those requests never touch GitHub. It runs inside GitHub Copilot Chat, which is the host application and performs its own network activity (telemetry, and features such as conversation-title generation) that this extension cannot intercept or block. See [Privacy & Network Requests](#privacy--network-requests) for details.
+> **Privacy note**: This extension routes **LLM inference to your configured server only** — those requests never touch GitHub. It runs inside GitHub Copilot Chat, which is the host application and performs its own network activity (such as telemetry) that this extension cannot intercept or block. Some host features that default to GitHub — including conversation-title generation — can be redirected to a gateway model via VS Code's `chat.utilityModel` setting. See [Privacy & Network Requests](#privacy--network-requests) for details.
 
 ### Compatible Inference Servers
 
@@ -64,7 +64,7 @@ It also keeps the familiar benefits of self-hosting: inference stays on your net
 
 ### Prerequisites
 
-- **VS Code** 1.120.0 or later (VS Code's own native BYOK Custom Endpoint requires 1.122+)
+- **VS Code** 1.125.0 or later
 - **GitHub Copilot** extension installed and signed in
 - **Inference server** running with an OpenAI-compatible API
 
@@ -98,7 +98,7 @@ curl http://localhost:42069/v1/models
 
 1. Open VS Code **Settings** (`Ctrl+,` / `Cmd+,`)
 2. Search for **"Copilot LLM Gateway"**
-3. Set **Server URL** to your inference server address (e.g., `http://localhost:8000`)
+3. Set **Server URL** to your inference server address (e.g., `http://localhost:42069` to match the server started above; the setting defaults to `http://localhost:8000`)
 4. Configure other settings as needed (token limits, tool calling, etc.)
 
 ![Extension settings panel showing all configuration options](assets/screenshot-settings.png)
@@ -130,6 +130,12 @@ The model integrates seamlessly with Copilot's features including:
 - **Agent mode** for autonomous coding tasks
 - **Tool calling** for file operations, terminal commands, and more
 - **Context awareness** with `@workspace` and file references
+
+### Status Bar & Connection Info
+
+A status-bar entry (bottom-right) shows the gateway's connection state at a glance and turns into a live indicator while a request streams. Hover it for a detailed info popup — connection status, the detected models with their context windows and capabilities, running session token totals, the last request, and the active feature toggles. Click it to refresh the model list.
+
+![LLM Gateway status info dialog](assets/screenshot-status-dialog.png)
 
 ### Using your models in the Agents window (Preview)
 
@@ -178,6 +184,34 @@ Configure the extension through VS Code Settings (`Ctrl+,` / `Cmd+,`) → search
 | ----------------------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
 | **Default Max Tokens**        | `262144` | Fallback context window size (input tokens) used only when the inference server does not report one itself.  |
 | **Default Max Output Tokens** | `4096`   | Fallback maximum output tokens used only when the server does not report a context size.                     |
+| **Enable Image Input**        | `true`   | Advertise image-input capability for multimodal models and forward image parts as base64 `image_url`s.       |
+
+### Advanced Model Parameters
+
+Two settings let you pass extra sampling parameters straight through to the chat-completions request body. This is useful when your endpoint expects parameters like `temperature`, `top_p`, `top_k`, or `repetition_penalty` from the caller rather than configuring them server-side. Both are edited in `settings.json`.
+
+| Setting                | Default | Description                                                                                  |
+| ---------------------- | ------- | -------------------------------------------------------------------------------------------- |
+| **Extra Model Options**| `{}`    | Parameters merged into every chat-completions request, regardless of which model is active.  |
+| **Per Model Options**  | `{}`    | Parameters scoped to specific models, keyed by model id (with optional `*` wildcards).       |
+
+Different model families often need different sampling parameters for the same task, so a single flat `extraModelOptions` set rarely fits every model you switch between. `perModelOptions` lets you pin parameters per model. Keys match the model id **exactly**, or use a `*` wildcard to cover a whole family (case-insensitive). When several keys match, an exact-id entry wins over a wildcard entry.
+
+```jsonc
+{
+  // Applied to every model:
+  "github.copilot.llm-gateway.extraModelOptions": {
+    "repetition_penalty": 1.05
+  },
+  // Applied only to matching models (overrides extraModelOptions on conflict):
+  "github.copilot.llm-gateway.perModelOptions": {
+    "qwen*": { "temperature": 0.7, "top_p": 0.8, "top_k": 20 },
+    "deepseek-r1": { "temperature": 0.6 }
+  }
+}
+```
+
+The merge order, lowest to highest priority, is: `extraModelOptions` → matching `perModelOptions` → per-request options supplied by Copilot itself.
 
 ### Tool Calling Settings
 
@@ -196,6 +230,36 @@ These settings control how the extension handles agentic features like code edit
 | Setting              | Default | Description                                                                                                                                        |
 | -------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Verbose Logging**  | `false` | When enabled, the full request body (including messages and tool args) is written to the output channel. Keep disabled unless debugging an issue. |
+
+### Inline Completions (Experimental)
+
+VS Code does **not** let bring-your-own-key models power its own inline ("ghost text") code suggestions — that path still requires GitHub Copilot ([microsoft/vscode#318545](https://github.com/microsoft/vscode/issues/318545)). To fill the gap, this extension can provide its **own** inline completions straight from your inference server's `/v1/completions` endpoint, running *alongside* Copilot rather than through it.
+
+| Setting                          | Default | Description                                                                                                       |
+| -------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
+| **Enable Inline Completion**     | `false` | Turn on server-backed ghost-text completions.                                                                     |
+| **Inline Completion Model**      | `""`    | Model id to use. Blank = the first model the server reports. Prefer a small fill-in-the-middle / base model.       |
+| **Inline Completion Max Tokens** | `256`   | Maximum tokens generated per completion. Lower is faster.                                                          |
+| **Inline Completion Debounce**   | `300`   | Milliseconds to wait after the last keystroke before requesting a completion.                                     |
+| **Inline Completion Timeout**    | `3000`  | Per-request timeout (ms). Kept short so a slow server doesn't stall suggestions.                                   |
+
+**Requirements & notes:**
+
+- Your model/server must support **fill-in-the-middle (FIM)** via the `/v1/completions` `suffix` parameter (vLLM, llama.cpp, LM Studio, and most local servers do). The text before the cursor is sent as `prompt` and the text after as `suffix`.
+- Point **Inline Completion Model** at a code/FIM or `*-base` model for best results — chat-tuned models tend to be slower and chattier for raw completion.
+- If you already use GitHub Copilot's inline suggestions, leave this **off** to avoid two providers competing for the same ghost text.
+- Completions are best-effort: server errors or timeouts simply yield no suggestion (details go to the output channel) rather than interrupting you.
+
+### Using Gateway Models for Titles & Other Utility Tasks
+
+VS Code uses small background models for "utility" work — chat **title generation**, commit messages, rename/branch-name suggestions, settings search, and Git review. By default these use GitHub Copilot's built-in utility models, which are unavailable if you run BYOK without signing into GitHub.
+
+You can point them at one of your Gateway models instead, via VS Code's own settings (no extension configuration needed):
+
+- `chat.utilityModel` — titles, summaries, settings search, Git review
+- `chat.utilitySmallModel` — commit messages, rename and branch-name suggestions
+
+Open **Settings**, search for `chat.utilityModel` / `chat.utilitySmallModel`, and pick your Gateway model from the dropdown (its `LLM Gateway` models appear there once the server is connected). When running BYOK without GitHub sign-in, VS Code also shows a prompt in the Chat view to configure these.
 
 ## Recommended Models
 
@@ -323,10 +387,13 @@ The model outputs text like "Using the read_file tool..." instead of actually ca
 
 Access from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`):
 
-| Command                                                | Description                                           |
-| ------------------------------------------------------ | ----------------------------------------------------- |
-| **GitHub Copilot LLM Gateway: Test Server Connection** | Test connectivity and list available models          |
-| **GitHub Copilot LLM Gateway: Refresh Models**         | Re-probe the inference server and refresh the picker |
+| Command                                                | Description                                                          |
+| ------------------------------------------------------ | ------------------------------------------------------------------- |
+| **GitHub Copilot LLM Gateway: Configure Server**       | Set the server URL and API key (also opened from "Add Models…")     |
+| **GitHub Copilot LLM Gateway: Test Server Connection** | Test connectivity and list available models                         |
+| **GitHub Copilot LLM Gateway: Refresh Models**         | Re-probe the inference server and refresh the picker                |
+| **GitHub Copilot LLM Gateway: Edit Custom Headers**    | Add, edit, or remove custom HTTP headers (stored in secret storage) |
+| **GitHub Copilot LLM Gateway: Show Output Log**        | Open the extension's output channel                                 |
 
 ## Privacy & Network Requests
 
@@ -343,22 +410,22 @@ GitHub Copilot Chat is the host application. It performs its own network activit
 | Request | Why it happens | What is sent |
 | --- | --- | --- |
 | **GitHub authentication** | Copilot Chat requires a GitHub sign-in to activate, even for third-party model providers | OAuth tokens |
-| **Conversation title generation** | Copilot Chat sends your first message to GitHub's API to auto-generate a title | Your prompt text |
+| **Conversation title generation** | By default Copilot Chat sends your first message to GitHub's API to auto-generate a title — redirectable to a gateway model via `chat.utilityModel` | Your prompt text |
 | **Telemetry** | Copilot collects usage telemetry per its own policies | Usage metadata |
 
 ### Reducing exposure
 
 While you cannot fully eliminate GitHub network requests when using Copilot Chat, you can minimise them:
 
-- Set `"telemetry.telemetryLevel": "off"` in VS Code settings
-- Set `"github.copilot.advanced": { "authProvider": "github" }` telemetry-related options as available
+- Set `chat.utilityModel` (and `chat.utilitySmallModel`) to a gateway model so conversation titles, commit messages, and other utility prompts are sent to your server instead of GitHub — see [Using Gateway Models for Titles & Other Utility Tasks](#using-gateway-models-for-titles--other-utility-tasks).
+- Set `"telemetry.telemetryLevel": "off"` in VS Code settings to reduce VS Code/Copilot telemetry.
 
-> **Note**: We have no control over the Copilot Chat host extension's behaviour. The good news is
+> **Note**: We have no control over the Copilot Chat host extension's core behaviour (auth, telemetry). The good news is
 > that **VS Code 1.122 made BYOK work without a GitHub sign-in** — the native Custom Endpoint provider
 > can run chat, tools, and MCP fully air-gapped, so if strict network isolation is your priority that
-> path is worth evaluating. One gap remains worth requesting upstream on the
-> [VS Code Copilot repository](https://github.com/microsoft/vscode-copilot-release): that conversation
-> title generation use the selected model provider rather than hardcoded GitHub endpoints.
+> path is worth evaluating. Utility tasks that used to be hardcoded to GitHub — including conversation
+> title generation — can now be routed to your own model via the `chat.utilityModel` /
+> `chat.utilitySmallModel` settings, keeping that text on your server too.
 
 ## Support
 
