@@ -1,5 +1,6 @@
 import type { CancellationToken, LanguageModelChatInformation } from 'vscode';
 import { GatewayClient } from '../api/client';
+import { OllamaModelInfo } from '../api/ollamaInfo';
 import { GatewayConfig } from '../config/gatewayConfig';
 import { TOKEN_CONSTANTS } from '../chat/tokenBudget';
 import { parseContextOverflowError, resolveContextWindowOverride } from '../chat/contextWindow';
@@ -47,6 +48,13 @@ export class ModelCatalog {
    * on config reload since the server (or its presets) may have changed.
    */
   private readonly learnedContextByModelId: Map<string, number> = new Map();
+  /**
+   * Ollama `/api/show` metadata per model id (context, sampler params,
+   * capabilities). Rebuilt on every model fetch; empty for non-Ollama
+   * backends. Lets the chat path auto-apply Modelfile sampler params so the
+   * user doesn't have to mirror them in `perModelOptions` client-side.
+   */
+  private readonly ollamaInfoByModelId: Map<string, OllamaModelInfo> = new Map();
   private lastSuccessfulFetchAt?: number;
   private lastConnectionError?: string;
 
@@ -59,6 +67,16 @@ export class ModelCatalog {
 
   public getContextForModel(modelId: string): number | undefined {
     return this.contextByModelId.get(modelId);
+  }
+
+  /**
+   * Numeric Modelfile sampler params discovered from Ollama `/api/show`
+   * (temperature, top_p, top_k, ...), or `undefined` for non-Ollama backends
+   * or before the first model fetch. Consumed by the chat request handler to
+   * fill sampler params the caller/settings didn't specify.
+   */
+  public getOllamaParamsForModel(modelId: string): Readonly<Record<string, number>> | undefined {
+    return this.ollamaInfoByModelId.get(modelId)?.params;
   }
 
   public getLastSuccessfulFetchAt(): number | undefined {
@@ -156,41 +174,61 @@ export class ModelCatalog {
     // removed a model, drop its entry so stale data can't leak into future
     // chat requests.
     this.contextByModelId.clear();
+    this.ollamaInfoByModelId.clear();
 
     const config = this.deps.getConfig();
-    const models = uniqueModels.map((model) => {
-      const contextOverride = resolveContextWindowOverride(
-        model.id,
-        config.modelContextWindows
-      );
-      const { info, totalContext, hasServerReportedContext } = buildModelInfo({
-        model,
-        defaultMaxTokens: config.defaultMaxTokens,
-        defaultMaxOutputTokens: config.defaultMaxOutputTokens,
-        capabilities: {
-          imageInput: config.enableImageInput,
-          toolCalling: config.enableToolCalling,
-        },
-        contextOverride,
-      });
-      this.contextByModelId.set(model.id, totalContext);
+    const models = await Promise.all(
+      uniqueModels.map(async (model) => {
+        const contextOverride = resolveContextWindowOverride(
+          model.id,
+          config.modelContextWindows
+        );
 
-      if (contextOverride !== undefined) {
-        log(
-          `  Model ${model.id}: context ${totalContext} tokens from 'modelContextWindows' setting (exposed as input=${info.maxInputTokens}, output=${info.maxOutputTokens})`
-        );
-      } else if (hasServerReportedContext) {
-        log(
-          `  Model ${model.id}: server-reported context ${totalContext} tokens (exposed as input=${info.maxInputTokens}, output=${info.maxOutputTokens})`
-        );
-      } else {
-        log(
-          `  Model ${model.id}: no server-reported context; using defaultMaxTokens=${totalContext}. If this is wrong, set 'github.copilot.llm-gateway.modelContextWindows'.`
-        );
-      }
+        // Ollama-only: discover context, capabilities, and sampler params from
+        // the native /api/show endpoint. The OpenAI /v1/models list carries
+        // none of this, so without it context falls back to the default and
+        // the client can't see per-model capabilities or Modelfile sampling.
+        const ollama =
+          typeof this.deps.client.showModel === 'function'
+            ? await this.deps.client.showModel(model.id, token)
+            : undefined;
+        if (ollama) {
+          this.ollamaInfoByModelId.set(model.id, ollama);
+        }
+        const discoveredContext = ollama?.numCtx ?? ollama?.trainedContext;
+        const caps = ollama?.capabilities;
 
-      return info;
-    });
+        const { info, totalContext, hasServerReportedContext } = buildModelInfo({
+          model,
+          defaultMaxTokens: config.defaultMaxTokens,
+          defaultMaxOutputTokens: config.defaultMaxOutputTokens,
+          capabilities: {
+            imageInput: config.enableImageInput && (caps ? caps.includes('vision') : true),
+            toolCalling: config.enableToolCalling && (caps ? caps.includes('tools') : true),
+          },
+          contextOverride,
+          discoveredContext,
+        });
+        this.contextByModelId.set(model.id, totalContext);
+
+        if (contextOverride !== undefined) {
+          log(`  Model ${model.id}: context ${totalContext} tokens from 'modelContextWindows' setting`);
+        } else if (discoveredContext !== undefined) {
+          const src = ollama?.numCtx !== undefined ? 'Ollama num_ctx' : 'Ollama trained context';
+          log(`  Model ${model.id}: context ${totalContext} tokens from ${src} (/api/show)`);
+        } else if (hasServerReportedContext) {
+          log(`  Model ${model.id}: server-reported context ${totalContext} tokens`);
+        } else {
+          log(`  Model ${model.id}: no reported context; using defaultMaxTokens=${totalContext}. Set 'github.copilot.llm-gateway.modelContextWindows' if wrong.`);
+        }
+        if (ollama) {
+          const samplerKeys = Object.keys(ollama.params).join(', ') || '(none)';
+          log(`  Model ${model.id}: capabilities [${ollama.capabilities.join(', ')}]; discovered params: ${samplerKeys}`);
+        }
+
+        return info;
+      })
+    );
 
     log(`Found ${models.length} models: ${models.map((m) => m.id).join(', ')}`);
     return models;

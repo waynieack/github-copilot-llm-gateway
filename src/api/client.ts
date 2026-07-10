@@ -7,6 +7,7 @@ import {
   OpenAIUsage,
 } from './types';
 import { GatewayConfig } from '../config/gatewayConfig';
+import { OllamaModelInfo, parseOllamaShowResponse } from './ollamaInfo';
 import {
   AccumulatedToolCall,
   LegacyFunctionCall,
@@ -554,6 +555,34 @@ export class GatewayClient {
       );
     }
     return await response.json();
+  }
+
+  /**
+   * Fetch Ollama-specific model metadata via the native `POST /api/show`
+   * endpoint (context window, Modelfile sampler params, capabilities).
+   * Returns `undefined` for non-Ollama servers — they 404 the path or return
+   * a body that doesn't parse — so callers fall back to existing behaviour.
+   */
+  public async showModel(
+    modelId: string,
+    cancellationToken?: vscode.CancellationToken
+  ): Promise<OllamaModelInfo | undefined> {
+    const base = normalizeBaseUrl(this.config.serverUrl);
+    try {
+      const response = await this.fetchWithTimeout(
+        `${base}/api/show`,
+        {
+          method: 'POST',
+          headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: modelId }),
+        },
+        cancellationToken
+      );
+      if (!response.ok) { return undefined; }
+      return parseOllamaShowResponse(await response.json());
+    } catch {
+      return undefined;
+    }
   }
 
   private getHeaders(): Record<string, string> {
